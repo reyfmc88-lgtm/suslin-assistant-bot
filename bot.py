@@ -67,6 +67,9 @@ BOT_PERSONA_BASE = (
 
 def clean_markdown(text: str) -> str:
     """Remove Markdown formatting from LLM response for clean Telegram display."""
+    # First pass: remove all ** and __ markers (brute force)
+    text = text.replace('**', '')
+    text = text.replace('__', '')
     # Remove markdown table separators like |---|---|---|
     text = re.sub(r'\|[-:]+\|[-:| ]+\|', '', text)
     # Remove table row pipes at start/end of lines
@@ -74,14 +77,9 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'\s*\|\s*$', '', text, flags=re.MULTILINE)
     # Replace remaining pipes used as column separators
     text = re.sub(r'\s*\|\s*', ' — ', text)
-    # Remove bold/italic markers (including multiline)
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    # Remove remaining italic markers
     text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'_(.+?)_', r'\1', text, flags=re.DOTALL)
-    # Catch any remaining standalone ** or *
-    text = text.replace('**', '')
-    text = text.replace('__', '')
+    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text, flags=re.DOTALL)
     # Remove headers
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
     # Remove code blocks
