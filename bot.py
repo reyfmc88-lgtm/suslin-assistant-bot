@@ -1,193 +1,277 @@
-import os
-import logging
-import requests
+import asyncio
 import csv
 import io
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import json
+import logging
+import os
+import re
+from datetime import datetime
+from functools import lru_cache
+from zoneinfo import ZoneInfo
+
+import requests
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from openai import OpenAI
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Configuration from Environment Variables
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8959543595:AAGt6WfZEiesptCFCHhaU_mg2p2pZO_8rws')
-GROQ_API_KEY = os.getenv('GROQ_API_KEY', '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')
-GROQ_API_BASE = os.getenv('GROQ_API_BASE', 'https://api.groq.com/openai/v1')
-OWNER_USERNAME = os.getenv('OWNER_USERNAME', '@Oleg_Suslin')
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '1sD8mYWY5j5Eo-nv7S1rOw_tAmdGl2OC7lXgxgTuGRIU')
-MODEL_NAME = os.getenv('MODEL_NAME', 'llama-3.3-70b-versatile')
+# Railway environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_BASE = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Oleg_Suslin")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1sD8mYWY5j5Eo-nv7S1rOw_tAmdGl2OC7lXgxgTuGRIU")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# Groq is OpenAI-compatible
-client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_API_BASE)
+# The service account must be granted Editor access to the spreadsheet.
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+INCOMING_SHEET_NAME = "Входящие"
+TASK_TRIGGERS = (
+    "создай задачу",
+    "запиши таску",
+    "запиши задачу",
+    "есть работа",
+    "добавь в бэклог",
+)
+PRIORITIES = {"высокий": "Высокий", "средний": "Средний", "низкий": "Низкий"}
 
-# Enable logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Global variable to store owner chat_id
-owner_chat_id = None
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is required")
 
-# Bot persona
+# Groq is compatible with the OpenAI Python SDK.
+llm_client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_API_BASE)
+owner_chat_id: int | None = None
+
 BOT_PERSONA_BASE = (
     "Ты — ИИ-ассистент Олега Суслина, PPM проектов Альфа-Инвестиции. "
     "Твоя задача — отвечать на вопросы коллег и клиентов от его имени. "
     "Отвечай вежливо, профессионально и на русском языке. "
     "Используй данные из базы знаний ниже как основной источник информации для ответов. "
-    "Если вопрос совсем не касается работы или Альфа-Инвестиций, мягко верни разговор к теме."
+    "Если вопрос совсем не касается работы или Альфа-Инвестиций, мягко верни разговор к теме. "
+    "ВАЖНО: Форматируй ответы простым текстом без Markdown-разметки. "
+    "Не используй таблицы (|), звёздочки (**), решётки (#) и другие Markdown-символы. "
+    "Для структурирования используй простые переносы строк, тире (—) и нумерацию (1. 2. 3.)."
 )
 
 
-def fetch_sheet_csv(sheet_name: str) -> list:
-    """Fetches public Google Sheet tab as list of rows using CSV export URL."""
-    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+def fetch_sheet_csv(sheet_name: str) -> list[list[str]]:
+    """Read a publicly viewable tab from Google Sheets through CSV export."""
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet={requests.utils.quote(sheet_name)}"
+    )
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            reader = csv.reader(io.StringIO(response.text))
-            return list(reader)
-        else:
-            logger.error(f"Failed to fetch sheet {sheet_name}, status code: {response.status_code}")
-            return []
-    except Exception as e:
-        logger.error(f"Exception fetching sheet {sheet_name}: {e}")
+        response.raise_for_status()
+        return list(csv.reader(io.StringIO(response.text)))
+    except Exception as exc:
+        logger.error("Could not read sheet %s: %s", sheet_name, exc)
         return []
 
 
-def format_rows_as_text(rows: list, sheet_label: str) -> str:
-    """Formats a list of CSV rows into a readable text block."""
+def format_rows_as_text(rows: list[list[str]], sheet_label: str) -> str:
+    """Convert the rows of a knowledge-base tab to concise LLM context."""
     if not rows:
         return f"[{sheet_label}: данные отсутствуют]\n"
 
+    headers = rows[0]
     lines = [f"=== {sheet_label} ==="]
-    headers = rows[0] if rows else []
     for row in rows[1:]:
-        if not any(cell.strip() for cell in row if cell):
-            continue
-        parts = []
-        for i, cell in enumerate(row):
-            header = headers[i] if i < len(headers) else f"Столбец {i+1}"
-            if cell:
-                parts.append(f"{header}: {cell}")
+        parts = [
+            f"{headers[index] if index < len(headers) else f'Столбец {index + 1}'}: {value}"
+            for index, value in enumerate(row)
+            if value.strip()
+        ]
         if parts:
             lines.append(" | ".join(parts))
-    lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
 
 def build_knowledge_context() -> str:
-    """Reads all three sheets via public CSV export and builds a knowledge context string."""
-    logger.info("Reading Google Sheets data via CSV export...")
+    """Fetch current Projects, Backlog and FAQ data for every answer."""
+    logger.info("Reading knowledge base through public CSV export")
+    return "\n".join(
+        [
+            "БАЗА ЗНАНИЙ ПО ПРОЕКТАМ АЛЬФА-ИНВЕСТИЦИИ (актуальные данные из Google Таблицы):\n",
+            format_rows_as_text(fetch_sheet_csv("Проекты"), "Проекты"),
+            format_rows_as_text(fetch_sheet_csv("Бэклог"), "Бэклог"),
+            format_rows_as_text(fetch_sheet_csv("FAQ"), "FAQ"),
+        ]
+    )
 
-    projects_rows = fetch_sheet_csv("Проекты")
-    backlog_rows = fetch_sheet_csv("Бэклог")
-    faq_rows = fetch_sheet_csv("FAQ")
 
-    context_parts = [
-        "БАЗА ЗНАНИЙ ПО ПРОЕКТАМ АЛЬФА-ИНВЕСТИЦИИ (актуальные данные из Google Таблицы):\n",
-        format_rows_as_text(projects_rows, "Проекты: Название, PO, Команда, Статус, Описание, Метрики"),
-        format_rows_as_text(backlog_rows, "Бэклог: Задачи и фичи по проектам"),
-        format_rows_as_text(faq_rows, "FAQ: Часто задаваемые вопросы и ответы"),
-    ]
+@lru_cache(maxsize=1)
+def get_sheets_service():
+    """Build an authenticated Google Sheets client from a Railway secret."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not configured. "
+            "Set it in Railway and give the service-account email Editor access to the spreadsheet."
+        )
 
-    context = "\n".join(context_parts)
-    logger.info(f"Knowledge context built: {len(context)} chars")
-    return context
+    try:
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON contains invalid JSON") from exc
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=GOOGLE_SHEETS_SCOPES,
+    )
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
+def extract_task(message: str) -> tuple[str, str] | None:
+    """Return (description, priority) when a message starts with a configured task trigger."""
+    normalized_message = message.casefold().strip()
+    matched_trigger = next(
+        (trigger for trigger in TASK_TRIGGERS if trigger in normalized_message),
+        None,
+    )
+    if not matched_trigger:
+        return None
+
+    trigger_position = normalized_message.find(matched_trigger)
+    description = message[trigger_position + len(matched_trigger):].strip(" \t\n:,-—–")
+    if not description:
+        return "", "Средний"
+
+    priority_match = re.search(
+        r"(?:приоритет\s*[:=-]?\s*)(высокий|средний|низкий)\b",
+        description,
+        flags=re.IGNORECASE,
+    )
+    priority = PRIORITIES.get(priority_match.group(1).casefold(), "Средний") if priority_match else "Средний"
+    if priority_match:
+        description = (description[:priority_match.start()] + description[priority_match.end():]).strip(" \t\n:,-—–")
+
+    return description, priority
+
+
+def append_incoming_task(description: str, author: str, priority: str) -> None:
+    """Append a new incoming task to Google Sheets using service-account credentials."""
+    current_date = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M")
+    body = {
+        "values": [[description, author, current_date, priority, "Новая"]]
+    }
+
+    get_sheets_service().spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{INCOMING_SHEET_NAME}!A:E",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body=body,
+    ).execute()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message on /start."""
+    """Send a welcome message."""
     user = update.effective_user
-    welcome_text = (
+    await update.message.reply_html(
         f"Привет, {user.mention_html()}!\n\n"
         "Я — ИИ-ассистент Олега Суслина, PPM проектов Альфа-Инвестиции. "
-        "Готов ответить на ваши вопросы по нашим проектам и продуктам. "
-        "Мои ответы основаны на актуальных данных из базы знаний."
-    )
-    await update.message.reply_html(welcome_text)
+        "Отвечаю на вопросы по проектам и записываю задачи в общий входящий бэклог.\n\n"
+        "Чтобы создать задачу, напишите, например: «Создай задачу: подготовить статус по ИИ-агенту».")
 
 
 async def register_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Registers the owner's chat ID."""
+    """Register the owner's chat ID for error notifications."""
     global owner_chat_id
-    if update.effective_user.username == OWNER_USERNAME.lstrip('@'):
+    if update.effective_user.username == OWNER_USERNAME.lstrip("@"):
         owner_chat_id = update.effective_chat.id
         await update.message.reply_text("Вы успешно зарегистрированы как владелец бота.")
-        logger.info(f"Owner chat_id registered: {owner_chat_id}")
+        logger.info("Owner chat_id registered: %s", owner_chat_id)
     else:
         await update.message.reply_text("Только Олег Суслин может зарегистрироваться как владелец бота.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles ALL incoming text messages using Groq API with Google Sheets context."""
-    user_message = update.message.text
-    username = update.effective_user.username or update.effective_user.first_name
-    logger.info(f"Received message from {username}: {user_message}")
+    """Record task requests or answer normal questions through Groq."""
+    message = update.message.text
+    user = update.effective_user
+    username = user.username or user.full_name or str(user.id)
+    logger.info("Message from %s: %s", username, message)
+
+    task = extract_task(message)
+    if task is not None:
+        description, priority = task
+        if not description:
+            await update.message.reply_text(
+                "Укажите описание задачи после триггерной фразы. Например: "
+                "«Создай задачу: подготовить статус по ИИ-агенту»."
+            )
+            return
+
+        try:
+            await asyncio.to_thread(append_incoming_task, description, username, priority)
+            await update.message.reply_text(
+                "Задача записана во вкладку «Входящие».\n"
+                f"Описание: {description}\n"
+                f"Приоритет: {priority}\n"
+                "Статус: Новая"
+            )
+            logger.info("Incoming task recorded for %s", username)
+        except Exception as exc:
+            logger.error("Could not record incoming task: %s", exc, exc_info=True)
+            await update.message.reply_text(
+                "Не удалось записать задачу в Google Таблицу. "
+                "Пожалуйста, попробуйте позже или обратитесь к Олегу Суслину."
+            )
+        return
 
     try:
-        # Build knowledge context from Google Sheets on every request
-        knowledge_context = build_knowledge_context()
-
-        # Compose full system prompt with knowledge base
-        system_prompt = f"{BOT_PERSONA_BASE}\n\n{knowledge_context}"
-
-        response = client.chat.completions.create(
+        knowledge_context = await asyncio.to_thread(build_knowledge_context)
+        response = await asyncio.to_thread(
+            llm_client.chat.completions.create,
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
+                {"role": "system", "content": f"{BOT_PERSONA_BASE}\n\n{knowledge_context}"},
+                {"role": "user", "content": message},
             ],
             max_tokens=1000,
-            temperature=0.7
+            temperature=0.7,
         )
 
-        logger.info(f"Groq Response received: choices={bool(response.choices)}")
-
-        # Safe parsing
-        if response and hasattr(response, 'choices') and response.choices and len(response.choices) > 0:
-            choice = response.choices[0]
-            if choice.message and choice.message.content:
-                ai_response = choice.message.content
-                await update.message.reply_text(ai_response)
-                logger.info(f"Sent AI response to {username}")
-            else:
-                raise ValueError("Empty content in AI response")
+        if response and response.choices and response.choices[0].message.content:
+            await update.message.reply_text(response.choices[0].message.content)
+            logger.info("Sent Groq answer to %s", username)
         else:
-            raise ValueError("Invalid response structure from AI model")
-
-    except Exception as e:
-        logger.error(f"Error generating AI response: {e}", exc_info=True)
-        error_text = "Извините, произошла техническая ошибка при обработке вашего запроса."
-
+            raise ValueError("Empty or malformed LLM response")
+    except Exception as exc:
+        logger.error("Error generating response: %s", exc, exc_info=True)
         if owner_chat_id:
             try:
                 await context.bot.send_message(
                     chat_id=owner_chat_id,
-                    text=(
-                        f"Ошибка у бота при ответе пользователю "
-                        f"{update.effective_user.mention_html() if update.effective_user else 'Unknown'}.\n"
-                        f"Сообщение: {user_message}\nОшибка: {e}"
-                    )
+                    text=f"Ошибка бота. Сообщение от {username}: {message}\nОшибка: {exc}",
                 )
-                await update.message.reply_text(f"{error_text} Ваш вопрос переслан Олегу Суслину.")
-            except Exception as forward_err:
-                logger.error(f"Failed to forward error to owner: {forward_err}")
-                await update.message.reply_text(error_text)
-        else:
-            await update.message.reply_text(error_text)
+            except Exception as forwarding_error:
+                logger.error("Could not forward the error to owner: %s", forwarding_error)
+        await update.message.reply_text(
+            "Извините, произошла техническая ошибка при обработке вашего запроса."
+        )
 
 
 def main() -> None:
-    """Start the bot."""
+    """Run the long-polling Telegram bot."""
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("register_owner", register_owner))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info(f"Starting bot polling on Railway (v8 - Groq API + CSV) using {MODEL_NAME}...")
+    logger.info("Starting bot with task recording; model=%s", MODEL_NAME)
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
