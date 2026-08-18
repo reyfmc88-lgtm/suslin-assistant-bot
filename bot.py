@@ -58,10 +58,35 @@ BOT_PERSONA_BASE = (
     "Отвечай вежливо, профессионально и на русском языке. "
     "Используй данные из базы знаний ниже как основной источник информации для ответов. "
     "Если вопрос совсем не касается работы или Альфа-Инвестиций, мягко верни разговор к теме. "
-    "ВАЖНО: Форматируй ответы простым текстом без Markdown-разметки. "
-    "Не используй таблицы (|), звёздочки (**), решётки (#) и другие Markdown-символы. "
-    "Для структурирования используй простые переносы строк, тире (—) и нумерацию (1. 2. 3.)."
+    "СТРОГО ЗАПРЕЩЕНО использовать Markdown-разметку в ответах. "
+    "НИКОГДА не используй таблицы с символом |, звёздочки **, решётки #, обратные кавычки `. "
+    "Пиши ТОЛЬКО простым текстом. Для списков используй тире (—) или нумерацию (1. 2. 3.). "
+    "Для выделения используй ЗАГЛАВНЫЕ БУКВЫ, а не звёздочки."
 )
+
+
+def clean_markdown(text: str) -> str:
+    """Remove Markdown formatting from LLM response for clean Telegram display."""
+    # Remove markdown table separators like |---|---|---|
+    text = re.sub(r'\|[-:]+\|[-:| ]+\|', '', text)
+    # Remove table row pipes at start/end of lines
+    text = re.sub(r'^\s*\|\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*\|\s*$', '', text, flags=re.MULTILINE)
+    # Replace remaining pipes used as column separators
+    text = re.sub(r'\s*\|\s*', ' — ', text)
+    # Remove bold/italic markers
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    # Remove headers
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+    # Remove code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # Clean up multiple blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def fetch_sheet_csv(sheet_name: str) -> list[list[str]]:
@@ -142,7 +167,7 @@ def extract_task(message: str) -> tuple[str, str] | None:
         return None
 
     trigger_position = normalized_message.find(matched_trigger)
-    description = message[trigger_position + len(matched_trigger):].strip(" \t\n:,-—–")
+    description = message[trigger_position + len(matched_trigger):].strip(" \t\n:,-\u2014\u2013")
     if not description:
         return "", "Средний"
 
@@ -153,7 +178,7 @@ def extract_task(message: str) -> tuple[str, str] | None:
     )
     priority = PRIORITIES.get(priority_match.group(1).casefold(), "Средний") if priority_match else "Средний"
     if priority_match:
-        description = (description[:priority_match.start()] + description[priority_match.end():]).strip(" \t\n:,-—–")
+        description = (description[:priority_match.start()] + description[priority_match.end():]).strip(" \t\n:,-\u2014\u2013")
 
     return description, priority
 
@@ -243,7 +268,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
         if response and response.choices and response.choices[0].message.content:
-            await update.message.reply_text(response.choices[0].message.content)
+            ai_text = clean_markdown(response.choices[0].message.content)
+            await update.message.reply_text(ai_text)
             logger.info("Sent Groq answer to %s", username)
         else:
             raise ValueError("Empty or malformed LLM response")
